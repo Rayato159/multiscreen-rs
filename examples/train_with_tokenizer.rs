@@ -358,7 +358,16 @@ fn main() -> Result<()> {
     let mut trainer = Trainer::builder()
         .vocab_size(vocab_size)
         .budget(budget)
-        .device(device)
+        .device({
+            #[cfg(feature = "cuda")]
+            {
+                device.clone()
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                device
+            }
+        })
         .batch_size(args.batch_size)
         .seq_len(args.seq_len)
         .steps(args.steps)

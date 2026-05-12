@@ -32,7 +32,7 @@ fn parameter_budget_presets_validate_and_scale_up() -> Result<()> {
 
 #[test]
 fn estimated_parameter_count_matches_burn_module_count() -> Result<()> {
-    let device = default_device()?;
+    let device = Device::default();
     let config = MultiscreenModelConfig::tiny_for_tests();
     let model = DefaultMultiscreenModel::new(config.clone(), &device)?;
 
@@ -54,7 +54,7 @@ fn paper_10m_keeps_existing_dimensions() {
 
 #[test]
 fn multiscreen_model_forward_has_expected_shape() -> Result<()> {
-    let device = default_device()?;
+    let device = Device::default();
     let config = MultiscreenModelConfig::tiny_for_tests();
     let model = DefaultMultiscreenModel::new(config.clone(), &device)?;
     let tokens = Tensor::<DefaultAutodiffBackend, 2, Int>::from_data(
@@ -69,7 +69,7 @@ fn multiscreen_model_forward_has_expected_shape() -> Result<()> {
 
 #[test]
 fn multiscreen_model_can_train_and_infer_tokens() -> Result<()> {
-    let device = default_device()?;
+    let device = Device::default();
     let config = MultiscreenModelConfig::tiny_for_tests();
     let mut model = DefaultMultiscreenModel::new(config, &device)?;
     let training = ModelTrainingConfig {
@@ -104,7 +104,7 @@ fn multiscreen_model_can_train_and_infer_tokens() -> Result<()> {
 
 #[test]
 fn multiscreen_model_can_save_and_load_parameters() -> Result<()> {
-    let device = default_device()?;
+    let device = Device::default();
     let config = MultiscreenModelConfig::tiny_for_tests();
     let model = DefaultMultiscreenModel::new(config.clone(), &device)?;
     let mut restored = DefaultMultiscreenModel::new(config, &device)?;

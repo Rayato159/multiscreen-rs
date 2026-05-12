@@ -19,7 +19,7 @@
 //!         .batch_size(4)
 //!         .seq_len(64)
 //!         .steps(100)
-//!         .device(cpu()?)
+//!         .device(auto_device()?)
 //!         .build()?;
 //!
 //!     // Token sequences from YOUR tokenizer

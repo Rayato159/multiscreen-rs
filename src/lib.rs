@@ -12,7 +12,7 @@
 //!     let mut trainer = Trainer::builder()
 //!         .vocab_size(1000)
 //!         .budget(ParameterBudget::Params10M)
-//!         .device(cpu()?)
+//!         .device(auto_device()?)
 //!         .batch_size(16)
 //!         .seq_len(128)
 //!         .steps(50_000)
@@ -66,9 +66,8 @@
 //! use multiscreen_rs::prelude::*;
 //!
 //! fn main() -> multiscreen_rs::Result<()> {
-//!     let device = cpu()?;        // CPU (always available)
-//!     // let device = cuda(0)?;   // CUDA GPU (requires "cuda" feature)
-//!     // let device = auto_device()?; // best available
+//!     let device = auto_device()?;  // best available (CPU or CUDA)
+//!     // let device = cuda(0)?;       // CUDA GPU (requires "cuda" feature)
 //!     Ok(())
 //! }
 //! ```
@@ -79,7 +78,7 @@
 //! use multiscreen_rs::prelude::*;
 //!
 //! fn main() -> multiscreen_rs::Result<()> {
-//!     let device = cpu()?;
+//!     let device = auto_device()?;
 //!     let mut model = DefaultMultiscreenModel::new(
 //!         MultiscreenModelConfig::tiny_for_tests(),
 //!         &device,
@@ -137,7 +136,9 @@ pub(crate) mod screen;
 pub(crate) mod tile;
 
 // ---- High-level API re-exports ----
-pub use device::{auto_device, cpu, cuda};
+#[cfg(not(feature = "cuda"))]
+pub use device::cpu;
+pub use device::{auto_device, cuda};
 pub use inference::{ChatModel, GenerationConfig};
 pub use training::{ParameterBudget, Trainer, TrainingReport};
 
@@ -148,10 +149,13 @@ pub use model::{
     ModelTrainingConfig, ModelTrainingReport, MultiscreenModel, MultiscreenModelConfig,
     MultiscreenModelOutput, MultiscreenParameterBudget,
 };
-pub use runtime::{default_device, device_label, DefaultAutodiffBackend, DefaultBackend, Device};
+pub use runtime::{device_label, DefaultAutodiffBackend, DefaultBackend, Device};
+
+#[cfg(not(feature = "cuda"))]
+pub use runtime::default_device;
 
 #[cfg(feature = "cuda")]
-pub use runtime::{cuda_device, CudaAutodiffBackend, CudaDevice, CudaMultiscreenModel};
+pub use runtime::{CudaAutodiffBackend, CudaDevice, CudaMultiscreenModel};
 
 // ---- Engine types (lightweight transition engine) ----
 pub use config::{InferenceConfig, MultiscreenConfig, TrimConfig};

@@ -1,13 +1,19 @@
 // ---- High-level API (recommended for most users) ----
 pub use crate::{
-    auto_device, cpu, cuda, ChatModel, GenerationConfig, ParameterBudget, Trainer, TrainingReport,
+    auto_device, cuda, ChatModel, GenerationConfig, ParameterBudget, Trainer, TrainingReport,
 };
+
+#[cfg(not(feature = "cuda"))]
+pub use crate::cpu;
 
 // ---- Core types ----
 pub use crate::{
-    default_device, device_label, DefaultAutodiffBackend, DefaultBackend, DefaultMultiscreenModel,
-    Device, Error, Result,
+    device_label, DefaultAutodiffBackend, DefaultBackend, DefaultMultiscreenModel, Device, Error,
+    Result,
 };
+
+#[cfg(not(feature = "cuda"))]
+pub use crate::default_device;
 
 // ---- Model configuration ----
 pub use crate::{
@@ -27,7 +33,7 @@ pub use crate::{
 };
 
 #[cfg(feature = "cuda")]
-pub use crate::{cuda_device, Cuda, CudaAutodiffBackend, CudaDevice, CudaMultiscreenModel};
+pub use crate::{CudaAutodiffBackend, CudaDevice, CudaMultiscreenModel};
 
 pub use crate::AutodiffBackend;
 pub use crate::Backend;
