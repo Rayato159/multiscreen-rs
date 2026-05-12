@@ -6,6 +6,7 @@ license = "MIT"
 description = "A Rust implementation of the Multiscreen neural language model — training and inference powered by Burn."
 readme = "README.md"
 repository = "https://github.com/Rayato159/multiscreen-rs"
+documentation = "https://docs.rs/multiscreen-rs"
 keywords = ["multiscreen", "neural-network", "language-model", "burn"]
 categories = ["science", "text-processing"]
 include = [
