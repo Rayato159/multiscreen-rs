@@ -2,3 +2,5 @@
 /multiscreen-testing
 /experiment
 /runs
+/examples/data/*
+!/examples/data/.gitkeep

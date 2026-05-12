@@ -150,8 +150,26 @@ fn load_samples(dir: &Path) -> Result<Vec<String>> {
                         continue;
                     }
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                        // Format 1: {"text": "..."}
                         if let Some(s) = val.get("text").and_then(|v| v.as_str()) {
                             samples.push(s.to_owned());
+                        }
+                        // Format 2: {"messages": [{"role": "...", "content": "..."}, ...]}
+                        else if let Some(messages) =
+                            val.get("messages").and_then(|v| v.as_array())
+                        {
+                            let mut parts = Vec::new();
+                            for msg in messages {
+                                let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+                                let content =
+                                    msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                                if !content.is_empty() {
+                                    parts.push(format!("{}: {}", role, content));
+                                }
+                            }
+                            if !parts.is_empty() {
+                                samples.push(parts.join("\n"));
+                            }
                         }
                     }
                 }
