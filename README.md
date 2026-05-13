@@ -1,6 +1,6 @@
 # multiscreen-rs
 
-A Rust implementation of the Multiscreen neural language model — training and inference — powered by [Burn](https://github.com/tracel-ai/burn).
+A Rust implementation of the Multiscreen neural language model — training and inference — powered by [Burn](https://github.com/tracel-ai/burn), Original by: [Screening Is Enough](https://arxiv.org/pdf/2604.01178).
 
 - **CPU** by default (Burn Flex with runtime SIMD detection: SSE, AVX, AVX2, AVX-512, NEON)
 - **CUDA GPU** via `--features cuda` — runs natively on NVIDIA GPUs
