@@ -6,6 +6,13 @@ use burn::{
 use std::env;
 
 // ---------------------------------------------------------------------------
+// Inference-only backend (no autodiff)
+// ---------------------------------------------------------------------------
+
+/// Inference-only device type — same physical device, but without autodiff wrapper.
+pub type InferenceDevice = <DefaultBackend as BackendTypes>::Device;
+
+// ---------------------------------------------------------------------------
 // Backend selection (feature-gated)
 // ---------------------------------------------------------------------------
 

@@ -153,6 +153,55 @@ impl Trainer {
         self.train_on_token_sequences_with_callback(sequences, |_, _| {})
     }
 
+    /// Trains the model on chat-style (prompt, response) token-ID pairs.
+    ///
+    /// Each element of `chat_pairs` is `(prompt_token_ids, response_token_ids)`.
+    /// The model sees the full context but loss is computed only on response
+    /// tokens, preventing the model from learning to generate role labels.
+    ///
+    /// The `on_step` callback is invoked after each optimizer step with
+    /// `(step_index, loss_value)`.
+    pub fn train_on_chat_sequences_with_callback(
+        &mut self,
+        chat_pairs: &[(Vec<u32>, Vec<u32>)],
+        on_step: impl FnMut(usize, f32),
+    ) -> Result<TrainingReport> {
+        if chat_pairs.is_empty() {
+            return Err(Error::Training("no training chat pairs provided".into()));
+        }
+
+        let device = self.model_device();
+        let report =
+            self.model
+                .train_chat_sequences(chat_pairs, &self.training_config, &device, on_step)?;
+
+        let checkpoint_path = match &self.checkpoint_dir {
+            Some(dir) => {
+                let dir_path = Path::new(dir);
+                fs::create_dir_all(dir_path).map_err(|e| {
+                    Error::Io(format!(
+                        "failed to create checkpoint directory {:?}: {}",
+                        dir, e
+                    ))
+                })?;
+                let path = dir_path.join("checkpoint.mpk");
+                self.model.save_parameters(&path)?;
+                Some(path.to_string_lossy().into_owned())
+            }
+            None => None,
+        };
+
+        Ok(TrainingReport::from_model_report(&report, checkpoint_path))
+    }
+
+    /// Convenience wrapper that trains on chat pairs without a per-step callback.
+    pub fn train_on_chat_sequences(
+        &mut self,
+        chat_pairs: &[(Vec<u32>, Vec<u32>)],
+    ) -> Result<TrainingReport> {
+        self.train_on_chat_sequences_with_callback(chat_pairs, |_, _| {})
+    }
+
     /// Saves a model checkpoint to the given path.
     pub fn save_checkpoint(&self, path: &str) -> Result<()> {
         if let Some(parent) = Path::new(path).parent() {

@@ -511,81 +511,37 @@ impl<B: Backend> MultiscreenModel<B> {
         let values = tensor_to_vec(last_logits)?;
         argmax(&values).map(|idx| idx as u32)
     }
-}
 
-impl<B> MultiscreenModel<B>
-where
-    B: AutodiffBackend,
-{
-    /// Trains this model directly on token sequences.
+    /// Run a forward pass and return the full logit tensor.
     ///
-    /// The optional `on_step` callback is invoked after each optimizer step with
-    /// `(step_index, loss_value)`. Use it for progress logging, CSV export, etc.
-    pub fn train_token_sequences(
-        &mut self,
-        sequences: &[Vec<u32>],
-        training: &ModelTrainingConfig,
+    /// The returned tensor has shape `[1, seq_len, vocab_size]`.
+    /// This is useful for sampling-based generation (top-k, temperature, etc.)
+    /// where you need access to the raw logit values, not just the argmax.
+    ///
+    /// The `context` is padded/truncated to `seq_len` automatically.
+    pub fn forward_logits(
+        &self,
+        context: &[u32],
+        pad_token_id: u32,
         device: &B::Device,
-        mut on_step: impl FnMut(usize, f32),
-    ) -> Result<ModelTrainingReport> {
-        if training.batch_size == 0 {
-            return Err(Error::Training(
-                "batch_size must be greater than zero".to_string(),
-            ));
-        }
-        let windows = TrainingWindows::from_sequences(
-            sequences,
-            self.config().seq_len,
-            training.pad_token_id,
-        )?;
-        if windows.is_empty() {
-            return Err(Error::Training(
-                "training requires at least one sequence with two or more tokens".to_string(),
+    ) -> Result<Tensor<B, 3>> {
+        if context.is_empty() {
+            return Err(Error::Inference(
+                "context must contain at least one token".to_string(),
             ));
         }
 
-        let mut optimizer_config =
-            AdamWConfig::new().with_weight_decay(training.weight_decay as f32);
-        if let Some(max_norm) = training.grad_clip_norm.filter(|value| *value > 0.0) {
-            optimizer_config = optimizer_config
-                .with_grad_clipping(Some(GradientClippingConfig::Norm(max_norm as f32)));
-        }
-        let mut optimizer = optimizer_config.init::<B, Self>();
-        let mut model = self.clone();
-        let mut final_loss = f32::NAN;
-
-        for step in 0..training.steps {
-            let batch = windows.batch::<B>(step, training.batch_size, device)?;
-            let logits = model.forward(batch.inputs);
-            let loss = cross_entropy_loss_with_mask(logits, batch.targets, batch.loss_mask);
-            final_loss = tensor_scalar(loss.clone())?;
-            let grads = loss.backward();
-            let grads = GradientsParams::from_grads(grads, &model);
-            model = optimizer.step(training.learning_rate, model, grads);
-            on_step(step, final_loss);
-        }
-
-        if training.steps == 0 {
-            let batch = windows.batch::<B>(0, training.batch_size, device)?;
-            final_loss = tensor_scalar(cross_entropy_loss_with_mask(
-                model.forward(batch.inputs),
-                batch.targets,
-                batch.loss_mask,
-            ))?;
-        }
-
-        *self = model;
-
-        Ok(ModelTrainingReport {
-            steps: training.steps,
-            final_loss,
-            training_window_count: windows.len(),
-            parameter_count: self.parameter_count(),
-        })
+        let input = context_window(context, self.config().seq_len, pad_token_id);
+        let input = tensor_from_u32::<B, 2>(input, [1, self.config().seq_len], device)?;
+        let logits = self.forward(input);
+        Ok(logits)
     }
 
     /// Evaluates the model on token sequences, returning average loss,
     /// perplexity, and next-token prediction accuracy.
+    ///
+    /// This method works on any `Backend` (including non-autodiff), which makes
+    /// it safe to call on an inference-only model without VRAM growth.
     pub fn evaluate_on_sequences(
         &self,
         sequences: &[Vec<u32>],
@@ -681,6 +637,153 @@ where
             accuracy,
             num_batches,
             total_tokens,
+        })
+    }
+}
+
+impl<B> MultiscreenModel<B>
+where
+    B: AutodiffBackend,
+{
+    /// Trains this model directly on token sequences.
+    ///
+    /// The optional `on_step` callback is invoked after each optimizer step with
+    /// `(step_index, loss_value)`. Use it for progress logging, CSV export, etc.
+    pub fn train_token_sequences(
+        &mut self,
+        sequences: &[Vec<u32>],
+        training: &ModelTrainingConfig,
+        device: &B::Device,
+        mut on_step: impl FnMut(usize, f32),
+    ) -> Result<ModelTrainingReport> {
+        if training.batch_size == 0 {
+            return Err(Error::Training(
+                "batch_size must be greater than zero".to_string(),
+            ));
+        }
+        let windows = TrainingWindows::from_sequences(
+            sequences,
+            self.config().seq_len,
+            training.pad_token_id,
+        )?;
+        if windows.is_empty() {
+            return Err(Error::Training(
+                "training requires at least one sequence with two or more tokens".to_string(),
+            ));
+        }
+
+        let mut optimizer_config =
+            AdamWConfig::new().with_weight_decay(training.weight_decay as f32);
+        if let Some(max_norm) = training.grad_clip_norm.filter(|value| *value > 0.0) {
+            optimizer_config = optimizer_config
+                .with_grad_clipping(Some(GradientClippingConfig::Norm(max_norm as f32)));
+        }
+        let mut optimizer = optimizer_config.init::<B, Self>();
+        let mut model = self.clone();
+        let mut final_loss = f32::NAN;
+
+        for step in 0..training.steps {
+            let batch = windows.batch::<B>(step, training.batch_size, device)?;
+            let logits = model.forward(batch.inputs);
+            let loss = cross_entropy_loss_with_mask(logits, batch.targets, batch.loss_mask);
+            final_loss = tensor_scalar(loss.clone())?;
+            let grads = loss.backward();
+            let grads = GradientsParams::from_grads(grads, &model);
+            model = optimizer.step(training.learning_rate, model, grads);
+            on_step(step, final_loss);
+        }
+
+        if training.steps == 0 {
+            let batch = windows.batch::<B>(0, training.batch_size, device)?;
+            final_loss = tensor_scalar(cross_entropy_loss_with_mask(
+                model.forward(batch.inputs),
+                batch.targets,
+                batch.loss_mask,
+            ))?;
+        }
+
+        *self = model;
+
+        Ok(ModelTrainingReport {
+            steps: training.steps,
+            final_loss,
+            training_window_count: windows.len(),
+            parameter_count: self.parameter_count(),
+        })
+    }
+
+    /// Trains this model on chat-style (prompt, response) token-ID pairs.
+    ///
+    /// This is the chat-aware counterpart of [`train_token_sequences`]. The model
+    /// sees the full context (prompt + response) but loss is computed **only** on
+    /// the response tokens, preventing the model from learning to generate role
+    /// labels like `system:`, `user:`, or `assistant:`.
+    ///
+    /// Each element of `chat_pairs` is `(prompt_token_ids, response_token_ids)`.
+    /// The caller is responsible for appending an EOS token to the response IDs
+    /// when desired — the EOS token will receive `loss_mask = 1.0` like any other
+    /// response token.
+    pub fn train_chat_sequences(
+        &mut self,
+        chat_pairs: &[(Vec<u32>, Vec<u32>)],
+        training: &ModelTrainingConfig,
+        device: &B::Device,
+        mut on_step: impl FnMut(usize, f32),
+    ) -> Result<ModelTrainingReport> {
+        if training.batch_size == 0 {
+            return Err(Error::Training(
+                "batch_size must be greater than zero".to_string(),
+            ));
+        }
+        let windows = TrainingWindows::from_chat_sequences(
+            chat_pairs,
+            self.config().seq_len,
+            training.pad_token_id,
+        )?;
+        if windows.is_empty() {
+            return Err(Error::Training(
+                "training requires at least one chat pair that produces two or more tokens"
+                    .to_string(),
+            ));
+        }
+
+        let mut optimizer_config =
+            AdamWConfig::new().with_weight_decay(training.weight_decay as f32);
+        if let Some(max_norm) = training.grad_clip_norm.filter(|value| *value > 0.0) {
+            optimizer_config = optimizer_config
+                .with_grad_clipping(Some(GradientClippingConfig::Norm(max_norm as f32)));
+        }
+        let mut optimizer = optimizer_config.init::<B, Self>();
+        let mut model = self.clone();
+        let mut final_loss = f32::NAN;
+
+        for step in 0..training.steps {
+            let batch = windows.batch::<B>(step, training.batch_size, device)?;
+            let logits = model.forward(batch.inputs);
+            let loss = cross_entropy_loss_with_mask(logits, batch.targets, batch.loss_mask);
+            final_loss = tensor_scalar(loss.clone())?;
+            let grads = loss.backward();
+            let grads = GradientsParams::from_grads(grads, &model);
+            model = optimizer.step(training.learning_rate, model, grads);
+            on_step(step, final_loss);
+        }
+
+        if training.steps == 0 {
+            let batch = windows.batch::<B>(0, training.batch_size, device)?;
+            final_loss = tensor_scalar(cross_entropy_loss_with_mask(
+                model.forward(batch.inputs),
+                batch.targets,
+                batch.loss_mask,
+            ))?;
+        }
+
+        *self = model;
+
+        Ok(ModelTrainingReport {
+            steps: training.steps,
+            final_loss,
+            training_window_count: windows.len(),
+            parameter_count: self.parameter_count(),
         })
     }
 }
@@ -962,6 +1065,64 @@ struct TrainingWindows {
 }
 
 impl TrainingWindows {
+    /// Creates training windows from chat-style (prompt, response) pairs with loss masking.
+    ///
+    /// Tokens belonging to the prompt portion have `loss_mask = 0.0` so the model
+    /// sees them as context but does not learn to generate them. Response tokens
+    /// (including any EOS appended by the caller) have `loss_mask = 1.0`.
+    fn from_chat_sequences(
+        chat_pairs: &[(Vec<u32>, Vec<u32>)],
+        seq_len: usize,
+        pad_token_id: u32,
+    ) -> Result<Self> {
+        let mut windows = Vec::new();
+        for (prompt_ids, response_ids) in chat_pairs {
+            let mut full_seq = prompt_ids.clone();
+            full_seq.extend_from_slice(response_ids);
+
+            if full_seq.len() < 2 {
+                continue;
+            }
+
+            let prompt_len = prompt_ids.len();
+
+            let mut start = 0;
+            while start + 1 < full_seq.len() {
+                let end = (start + seq_len + 1).min(full_seq.len());
+                let chunk = &full_seq[start..end];
+                let prediction_count = chunk.len() - 1;
+
+                let mut inputs = vec![pad_token_id; seq_len];
+                let mut targets = vec![pad_token_id; seq_len];
+                let mut loss_mask = vec![0.0; seq_len];
+                inputs[..prediction_count].copy_from_slice(&chunk[..prediction_count]);
+                targets[..prediction_count].copy_from_slice(&chunk[1..]);
+
+                // Mask: only compute loss when the *target* token falls within the
+                // response portion of the full sequence.
+                for (i, mask) in loss_mask.iter_mut().enumerate().take(prediction_count) {
+                    let target_global_idx = start + i + 1;
+                    if target_global_idx >= prompt_len {
+                        *mask = 1.0;
+                    }
+                }
+
+                windows.push(TrainingWindow {
+                    inputs,
+                    targets,
+                    loss_mask,
+                });
+
+                if end == full_seq.len() {
+                    break;
+                }
+                start += seq_len;
+            }
+        }
+
+        Ok(Self { windows, seq_len })
+    }
+
     fn from_sequences(sequences: &[Vec<u32>], seq_len: usize, pad_token_id: u32) -> Result<Self> {
         let mut windows = Vec::new();
         for sequence in sequences {

@@ -37,8 +37,9 @@
 //! ```
 
 use crate::error::{Error, Result};
-use crate::model::{DefaultMultiscreenModel, ModelInferenceConfig, MultiscreenModelConfig};
-use crate::runtime::{default_device, Device};
+use crate::model::{ModelInferenceConfig, MultiscreenModel, MultiscreenModelConfig};
+use crate::runtime::{default_device, DefaultAutodiffBackend, DefaultBackend, InferenceDevice};
+use burn::module::AutodiffModule;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -87,8 +88,8 @@ impl Default for GenerationConfig {
 /// }
 /// ```
 pub struct ChatModel {
-    model: DefaultMultiscreenModel,
-    device: Device,
+    model: MultiscreenModel<DefaultBackend>,
+    device: InferenceDevice,
     config: MultiscreenModelConfig,
 }
 
@@ -127,13 +128,19 @@ impl ChatModel {
         };
 
         // ------ device + model ------
+        // Load with Autodiff backend first (needed for parameter loading),
+        // then convert to inference-only inner backend via .valid().
+        // This prevents VRAM leak from autodiff computation graphs during
+        // autoregressive generation.
         let device = default_device()?;
-        let mut model = DefaultMultiscreenModel::new(config.clone(), &device)?;
+        let mut model = MultiscreenModel::<DefaultAutodiffBackend>::new(config.clone(), &device)?;
         model.load_parameters(checkpoint_path)?;
+        let inner_device = device.clone();
+        let model = model.valid(); // Strip Autodiff wrapper → MultiscreenModel<DefaultBackend>
 
         Ok(Self {
             model,
-            device,
+            device: inner_device,
             config,
         })
     }
@@ -203,8 +210,18 @@ impl ChatModel {
         Ok(output.token_ids)
     }
 
+    /// Run a forward pass on the padded context and return logits.
+    ///
+    /// Returns a tensor of shape `[1, seq_len, vocab_size]`.
+    /// Use this for custom sampling strategies (top-k, temperature, etc.).
+    pub fn predict_logits(&self, context: &[u32]) -> Result<burn::Tensor<DefaultBackend, 3>> {
+        let pad_token_id = 0;
+        self.model
+            .forward_logits(context, pad_token_id, &self.device)
+    }
+
     /// Access the underlying neural model.
-    pub fn model(&self) -> &DefaultMultiscreenModel {
+    pub fn model(&self) -> &MultiscreenModel<DefaultBackend> {
         &self.model
     }
 
@@ -214,7 +231,7 @@ impl ChatModel {
     }
 
     /// Access the device the model is running on.
-    pub fn device(&self) -> &Device {
+    pub fn device(&self) -> &InferenceDevice {
         &self.device
     }
 }

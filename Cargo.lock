@@ -3387,11 +3387,12 @@ dependencies = [
 
 [[package]]
 name = "multiscreen-rs"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "burn",
  "clap",
+ "rand 0.8.6",
  "sentencepiece-rs",
  "serde",
  "serde_json",

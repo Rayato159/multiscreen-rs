@@ -118,13 +118,17 @@ struct Args {
     /// Print loss every N steps.
     #[arg(long, default_value_t = 100)]
     log_interval: usize,
+
+    /// Skip training — load existing checkpoint and only run evaluation + report.
+    #[arg(long, default_value_t = false)]
+    eval_only: bool,
 }
 
 // ---------------------------------------------------------------------------
 // Data loading
 // ---------------------------------------------------------------------------
 
-fn load_samples(dir: &Path) -> Result<Vec<String>> {
+fn load_samples(dir: &Path) -> Result<Vec<(String, String)>> {
     let mut samples = Vec::new();
     for entry in fs::read_dir(dir).with_context(|| format!("cannot read {}", dir.display()))? {
         let entry = entry?;
@@ -132,12 +136,13 @@ fn load_samples(dir: &Path) -> Result<Vec<String>> {
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         match ext {
             "txt" => {
+                // Plain text: no masking, same as before.
                 let text = fs::read_to_string(&path)
                     .with_context(|| format!("cannot read {}", path.display()))?;
                 for line in text.lines() {
                     let trimmed = line.trim();
                     if !trimmed.is_empty() {
-                        samples.push(trimmed.to_owned());
+                        samples.push((String::new(), trimmed.to_owned()));
                     }
                 }
             }
@@ -151,24 +156,35 @@ fn load_samples(dir: &Path) -> Result<Vec<String>> {
                     }
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
                         // Format 1: {"text": "..."}
+                        // No masking — full text is the response.
                         if let Some(s) = val.get("text").and_then(|v| v.as_str()) {
-                            samples.push(s.to_owned());
+                            samples.push((String::new(), s.to_owned()));
                         }
                         // Format 2: {"messages": [{"role": "...", "content": "..."}, ...]}
+                        // Split into prompt (system + user) and response (assistant).
                         else if let Some(messages) =
                             val.get("messages").and_then(|v| v.as_array())
                         {
-                            let mut parts = Vec::new();
+                            let mut prompt_parts: Vec<String> = Vec::new();
+                            let mut response_parts: Vec<String> = Vec::new();
                             for msg in messages {
                                 let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
                                 let content =
                                     msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                                if !content.is_empty() {
-                                    parts.push(format!("{}: {}", role, content));
+                                if content.is_empty() {
+                                    continue;
+                                }
+                                match role {
+                                    "assistant" => {
+                                        response_parts.push(format!("{}: {}", role, content))
+                                    }
+                                    _ => prompt_parts.push(format!("{}: {}", role, content)),
                                 }
                             }
-                            if !parts.is_empty() {
-                                samples.push(parts.join("\n"));
+                            if !response_parts.is_empty() {
+                                let prompt = prompt_parts.join("\n");
+                                let response = response_parts.join("\n");
+                                samples.push((prompt, response));
                             }
                         }
                     }
@@ -284,25 +300,47 @@ fn main() -> Result<()> {
     }
     println!("loaded {} samples", samples.len());
 
-    let mut sequences: Vec<Vec<u32>> = samples
+    // Detect chat data: any sample with a non-empty prompt.
+    let has_chat_data = samples.iter().any(|(prompt, _)| !prompt.is_empty());
+    if has_chat_data {
+        println!("detected chat-format data — using loss masking for prompt tokens");
+    }
+
+    // Tokenize (prompt, response) pairs separately.
+    let mut chat_pairs: Vec<(Vec<u32>, Vec<u32>)> = samples
         .iter()
-        .map(|s| {
-            let mut ids = sp.encode(s);
+        .map(|(prompt, response)| {
+            let prompt_ids = if prompt.is_empty() {
+                Vec::new()
+            } else {
+                sp.encode(prompt)
+            };
+            let mut response_ids = sp.encode(response);
             if let Some(eos) = eos_id {
-                ids.push(eos);
+                response_ids.push(eos);
             }
-            ids
+            (prompt_ids, response_ids)
         })
-        .filter(|ids| ids.len() >= 2)
+        .filter(|(p, r)| p.len() + r.len() >= 2)
         .collect();
 
-    if sequences.is_empty() {
+    if chat_pairs.is_empty() {
         bail!("all samples tokenized to <2 tokens — cannot train");
     }
 
     // Deduplicate
-    sequences.sort();
-    sequences.dedup();
+    chat_pairs.sort();
+    chat_pairs.dedup();
+
+    // Build flat sequences for evaluation (prompt + response concatenated).
+    let sequences: Vec<Vec<u32>> = chat_pairs
+        .iter()
+        .map(|(p, r)| {
+            let mut seq = p.clone();
+            seq.extend_from_slice(r);
+            seq
+        })
+        .collect();
 
     let total_tokens: usize = sequences.iter().map(|s| s.len()).sum();
     println!(
@@ -312,20 +350,37 @@ fn main() -> Result<()> {
     );
 
     // --- Split data: 80% train, 10% val, 10% test ---
-    let n = sequences.len();
+    let n = chat_pairs.len();
     let val_count = ((n as f64 * args.val_split).ceil() as usize)
         .max(1)
         .min(n / 2);
     let test_count = val_count.min(n - val_count);
     let train_count = n.saturating_sub(val_count + test_count);
 
-    // Take the last sequences for val/test (they were sorted, so this gives variety)
-    let (train_seqs, rest) = sequences.split_at(train_count);
-    let (val_seqs, test_seqs) = rest.split_at(rest.len().min(val_count));
+    let (train_pairs, rest) = chat_pairs.split_at(train_count);
+    let (val_pairs, test_pairs) = rest.split_at(rest.len().min(val_count));
+
+    // Flat sequences for evaluation.
+    let val_seqs: Vec<Vec<u32>> = val_pairs
+        .iter()
+        .map(|(p, r)| {
+            let mut seq = p.clone();
+            seq.extend_from_slice(r);
+            seq
+        })
+        .collect();
+    let test_seqs: Vec<Vec<u32>> = test_pairs
+        .iter()
+        .map(|(p, r)| {
+            let mut seq = p.clone();
+            seq.extend_from_slice(r);
+            seq
+        })
+        .collect();
 
     println!(
         "split: {} train, {} val, {} test sequences",
-        train_seqs.len(),
+        train_pairs.len(),
         val_seqs.len(),
         test_seqs.len()
     );
@@ -344,116 +399,205 @@ fn main() -> Result<()> {
     fs::copy(&tokenizer_path, args.run_dir.join("tokenizer.model"))
         .with_context(|| "failed to copy tokenizer to run dir")?;
 
-    // --- Open loss CSV for writing ---
-    let loss_csv_path = args.run_dir.join("loss.csv");
-    let mut loss_csv = fs::File::create(&loss_csv_path)
-        .with_context(|| format!("cannot create loss CSV at {}", loss_csv_path.display()))?;
-    writeln!(loss_csv, "step,loss")?;
-
-    // --- Train using high-level Trainer ---
+    // --- Device ---
     let device = auto_device()?;
     let device_name = device_label(&device);
     println!("device: {device_name}");
 
-    let mut trainer = Trainer::builder()
-        .vocab_size(vocab_size)
-        .budget(budget)
-        .device({
-            #[cfg(feature = "cuda")]
-            {
-                device.clone()
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                device
-            }
-        })
-        .batch_size(args.batch_size)
-        .seq_len(args.seq_len)
-        .steps(args.steps)
-        .learning_rate(args.lr)
-        .checkpoint_dir(ckpt_dir.to_string_lossy().into_owned())
-        .build()?;
-
-    let log_interval = args.log_interval;
-    let mut best_loss = f64::MAX;
-    let mut loss_values: Vec<(usize, f64)> = Vec::with_capacity(args.steps);
-
-    println!("\ntraining {} steps...", args.steps);
-    let train_start = Instant::now();
-
-    let report = trainer.train_on_token_sequences_with_callback(train_seqs, |step, loss| {
-        let loss_f64 = loss as f64;
-        if loss_f64 < best_loss {
-            best_loss = loss_f64;
-        }
-        loss_values.push((step, loss_f64));
-
-        // Write to CSV
-        let _ = writeln!(&mut loss_csv, "{step},{loss_f64}");
-
-        // Log progress
-        if step == 0 || (step + 1) % log_interval == 0 {
-            let elapsed = train_start.elapsed().as_secs_f64();
-            let sps = if step > 0 {
-                (step + 1) as f64 / elapsed
-            } else {
-                0.0
-            };
-            println!(
-                "  step {}/{}  loss={:.6}  best={:.6}  {:.1} steps/s",
-                step + 1,
-                args.steps,
-                loss_f64,
-                best_loss,
-                sps
-            );
-        }
-    })?;
-
-    let train_duration = train_start.elapsed();
-    let train_secs = train_duration.as_secs_f64();
-    let steps_per_sec = args.steps as f64 / train_secs;
-
-    // Flush CSV
-    drop(loss_csv);
-
-    println!(
-        "\ntraining complete in {:.1}s ({:.1} steps/s)",
-        train_secs, steps_per_sec
-    );
-    println!(
-        "  final loss: {:.6}  best loss: {:.6}  params: {}",
-        report.final_loss, best_loss, report.parameter_count
-    );
-
-    // --- Save final checkpoint + metadata ---
     let final_ckpt = ckpt_dir.join("latest.mpk");
-    trainer.save_checkpoint(final_ckpt.to_str().unwrap())?;
-    println!("checkpoint: {}", final_ckpt.display());
 
-    let meta = RunMeta {
-        step: report.steps,
-        loss: report.final_loss as f64,
-        params: report.parameter_count,
-        model_config: config,
+    // --- Loss CSV path (used by both train mode and final message) ---
+    let loss_csv_path = args.run_dir.join("loss.csv");
+
+    // --- Train or eval-only ---
+    let (train_steps, final_loss, train_params, train_secs, steps_per_sec, best_loss) = if args
+        .eval_only
+    {
+        // === EVAL-ONLY MODE: skip training, load existing checkpoint ===
+        anyhow::ensure!(
+            final_ckpt.exists(),
+            "--eval-only requires an existing checkpoint at {}",
+            final_ckpt.display()
+        );
+        let meta_path = ckpt_dir.join("latest.json");
+        let meta: RunMeta = if meta_path.exists() {
+            let json = fs::read_to_string(&meta_path)
+                .with_context(|| format!("cannot read {}", meta_path.display()))?;
+            serde_json::from_str(&json)
+                .with_context(|| format!("cannot parse {}", meta_path.display()))?
+        } else {
+            anyhow::bail!(
+                "--eval-only requires {} from a previous training run",
+                meta_path.display()
+            );
+        };
+        println!("skipping training, loading checkpoint from previous run");
+        println!(
+            "  step={}  loss={:.6}  params={}",
+            meta.step, meta.loss, meta.params
+        );
+
+        (
+            meta.step,
+            meta.loss as f32,
+            meta.params,
+            0.0,
+            0.0,
+            meta.loss,
+        )
+    } else {
+        // === FULL TRAINING MODE ===
+        let mut loss_csv = fs::File::create(&loss_csv_path)
+            .with_context(|| format!("cannot create loss CSV at {}", loss_csv_path.display()))?;
+        writeln!(loss_csv, "step,loss")?;
+
+        let mut trainer = Trainer::builder()
+            .vocab_size(vocab_size)
+            .budget(budget)
+            .device({
+                #[cfg(feature = "cuda")]
+                {
+                    device.clone()
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    device
+                }
+            })
+            .batch_size(args.batch_size)
+            .seq_len(args.seq_len)
+            .steps(args.steps)
+            .learning_rate(args.lr)
+            .checkpoint_dir(ckpt_dir.to_string_lossy().into_owned())
+            .build()?;
+
+        let log_interval = args.log_interval;
+        let mut bl = f64::MAX;
+        let _loss_values: Vec<(usize, f64)> = Vec::new();
+
+        println!("\ntraining {} steps...", args.steps);
+        let train_start = Instant::now();
+
+        let rpt = if has_chat_data {
+            trainer.train_on_chat_sequences_with_callback(train_pairs, |step, loss| {
+                let loss_f64 = loss as f64;
+                if loss_f64 < bl {
+                    bl = loss_f64;
+                }
+
+                // Write to CSV
+                let _ = writeln!(&mut loss_csv, "{step},{loss_f64}");
+
+                // Log progress
+                if step == 0 || (step + 1) % log_interval == 0 {
+                    let elapsed = train_start.elapsed().as_secs_f64();
+                    let sps = if step > 0 {
+                        (step + 1) as f64 / elapsed
+                    } else {
+                        0.0
+                    };
+                    println!(
+                        "  step {}/{}  loss={:.6}  best={:.6}  {:.1} steps/s",
+                        step + 1,
+                        args.steps,
+                        loss_f64,
+                        bl,
+                        sps
+                    );
+                }
+            })
+        } else {
+            // No chat data — fall back to plain token-sequence training.
+            let train_seqs: Vec<Vec<u32>> = train_pairs
+                .iter()
+                .map(|(p, r)| {
+                    let mut seq = p.clone();
+                    seq.extend_from_slice(r);
+                    seq
+                })
+                .collect();
+            trainer.train_on_token_sequences_with_callback(&train_seqs, |step, loss| {
+                let loss_f64 = loss as f64;
+                if loss_f64 < bl {
+                    bl = loss_f64;
+                }
+
+                // Write to CSV
+                let _ = writeln!(&mut loss_csv, "{step},{loss_f64}");
+
+                // Log progress
+                if step == 0 || (step + 1) % log_interval == 0 {
+                    let elapsed = train_start.elapsed().as_secs_f64();
+                    let sps = if step > 0 {
+                        (step + 1) as f64 / elapsed
+                    } else {
+                        0.0
+                    };
+                    println!(
+                        "  step {}/{}  loss={:.6}  best={:.6}  {:.1} steps/s",
+                        step + 1,
+                        args.steps,
+                        loss_f64,
+                        bl,
+                        sps
+                    );
+                }
+            })
+        }?;
+
+        let train_duration = train_start.elapsed();
+        let ts = train_duration.as_secs_f64();
+        let sps = args.steps as f64 / ts;
+
+        // Flush CSV
+        drop(loss_csv);
+
+        println!("\ntraining complete in {:.1}s ({:.1} steps/s)", ts, sps);
+        println!(
+            "  final loss: {:.6}  best loss: {:.6}  params: {}",
+            rpt.final_loss, bl, rpt.parameter_count
+        );
+
+        // Save final checkpoint + metadata
+        trainer.save_checkpoint(final_ckpt.to_str().unwrap())?;
+        println!("checkpoint: {}", final_ckpt.display());
+
+        let meta = RunMeta {
+            step: rpt.steps,
+            loss: rpt.final_loss as f64,
+            params: rpt.parameter_count,
+            model_config: config.clone(),
+        };
+        fs::write(
+            ckpt_dir.join("latest.json"),
+            serde_json::to_string_pretty(&meta)?,
+        )?;
+
+        // Free trainer + model from GPU before evaluation.
+        drop(trainer);
+
+        (rpt.steps, rpt.final_loss, rpt.parameter_count, ts, sps, bl)
     };
-    fs::write(
-        ckpt_dir.join("latest.json"),
-        serde_json::to_string_pretty(&meta)?,
-    )?;
 
     // --- Evaluate on val and test sets ---
     println!("\nevaluating...");
+
+    // Build an inference-only model for evaluation.
+    // Load with Autodiff backend first (for parameter loading), then strip
+    // the autodiff wrapper via .valid() so forward passes don't track gradients.
+    // This prevents VRAM from growing on every eval batch.
+    use burn::module::AutodiffModule;
+    let eval_model = {
+        let mut m = DefaultMultiscreenModel::new(config.clone(), &device)?;
+        m.load_parameters(&final_ckpt)?;
+        m.valid() // MultiscreenModel<Autodiff<Cuda>> → MultiscreenModel<Cuda>
+    };
+    let inner_device = device.clone();
+
     let val_metrics = if !val_seqs.is_empty() {
         println!("  validation set ({} sequences)...", val_seqs.len());
-        let result = trainer.model().evaluate_on_sequences(
-            val_seqs,
-            args.seq_len,
-            args.batch_size,
-            0,
-            &device,
-        )?;
+        let result =
+            eval_model.evaluate_on_sequences(&val_seqs, args.seq_len, 4, 0, &inner_device)?;
         println!(
             "    loss={:.4}  ppl={:.2}  accuracy={:.2}%  ({} tokens)",
             result.loss,
@@ -473,13 +617,8 @@ fn main() -> Result<()> {
 
     let test_metrics = if !test_seqs.is_empty() {
         println!("  test set ({} sequences)...", test_seqs.len());
-        let result = trainer.model().evaluate_on_sequences(
-            test_seqs,
-            args.seq_len,
-            args.batch_size,
-            0,
-            &device,
-        )?;
+        let result =
+            eval_model.evaluate_on_sequences(&test_seqs, args.seq_len, 4, 0, &inner_device)?;
         println!(
             "    loss={:.4}  ppl={:.2}  accuracy={:.2}%  ({} tokens)",
             result.loss,
@@ -496,6 +635,9 @@ fn main() -> Result<()> {
     } else {
         None
     };
+
+    // Free GPU memory before loading ChatModel (avoids CUDA OOM)
+    drop(eval_model);
 
     // --- Measure inference latency ---
     println!("\nmeasuring inference latency...");
@@ -539,19 +681,19 @@ fn main() -> Result<()> {
     // --- Write report ---
     let full_report = TrainReport {
         budget: args.budget.clone(),
-        parameter_count: param_count,
+        parameter_count: train_params,
         seq_len: args.seq_len,
         batch_size: args.batch_size,
         learning_rate: args.lr,
-        total_steps: args.steps,
+        total_steps: train_steps,
         train_duration_secs: train_secs,
         steps_per_sec,
-        final_train_loss: report.final_loss as f64,
+        final_train_loss: final_loss as f64,
         best_train_loss: best_loss,
         val: val_metrics,
         test: test_metrics,
         inference: Some(inference_metrics),
-        train_samples: train_seqs.len(),
+        train_samples: train_pairs.len(),
         val_samples: val_seqs.len(),
         test_samples: test_seqs.len(),
         total_tokens,
