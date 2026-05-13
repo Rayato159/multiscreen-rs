@@ -20,7 +20,7 @@
 //! python examples/plot_loss.py runs/10m-10k/loss.csv
 //! ```
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use multiscreen_rs::prelude::*;
 use sentencepiece_rs::SentencePieceProcessor;
@@ -136,15 +136,29 @@ fn load_samples(dir: &Path) -> Result<Vec<(String, String)>> {
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         match ext {
             "txt" => {
-                // Plain text: no masking, same as before.
+                // Plain text corpus: blank lines separate samples.
+                // Each sample can span multiple lines (joined with space).
+                // Single-line-per-sample also works (no blank line needed).
                 let text = fs::read_to_string(&path)
                     .with_context(|| format!("cannot read {}", path.display()))?;
+                let mut current_lines: Vec<String> = Vec::new();
+                let flush = |lines: &mut Vec<String>, out: &mut Vec<(String, String)>| {
+                    if !lines.is_empty() {
+                        let joined = lines.join(" ");
+                        if !joined.trim().is_empty() {
+                            out.push((String::new(), joined));
+                        }
+                        lines.clear();
+                    }
+                };
                 for line in text.lines() {
-                    let trimmed = line.trim();
-                    if !trimmed.is_empty() {
-                        samples.push((String::new(), trimmed.to_owned()));
+                    if line.trim().is_empty() {
+                        flush(&mut current_lines, &mut samples);
+                    } else {
+                        current_lines.push(line.trim().to_owned());
                     }
                 }
+                flush(&mut current_lines, &mut samples); // last sample
             }
             "jsonl" => {
                 let text = fs::read_to_string(&path)
