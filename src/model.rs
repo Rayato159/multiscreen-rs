@@ -630,12 +630,12 @@ where
                 .into_data()
                 .into_vec::<f32>()
                 .map_err(|e| Error::Inference(e.to_string()))?;
-            let target_vec: Vec<u32> = batch
+            let target_vec: Vec<i32> = batch
                 .targets
                 .clone()
                 .reshape([b * s])
                 .into_data()
-                .into_vec::<u32>()
+                .into_vec::<i32>()
                 .map_err(|e| Error::Inference(e.to_string()))?;
             let logit_vec: Vec<f32> = logits
                 .reshape([b * s * v])
