@@ -148,7 +148,7 @@ fn sample_token(
     let probs: Vec<(usize, f32)> = exps.iter().map(|&(idx, e)| (idx, e / sum)).collect();
 
     // Weighted random sample
-    let r: f32 = rng.gen();
+    let r: f32 = rng.r#gen();
     let mut cumulative = 0.0f32;
     for &(idx, p) in &probs {
         cumulative += p;
