@@ -79,6 +79,8 @@ fn multiscreen_model_can_train_and_infer_tokens() -> Result<()> {
         weight_decay: 0.0,
         grad_clip_norm: Some(1.0),
         pad_token_id: 0,
+        checkpoint_dir: None,
+        checkpoint_interval: 0,
     };
 
     let report = model.train_token_sequences(

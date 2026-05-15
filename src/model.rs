@@ -8,9 +8,8 @@ use burn::{
     optim::{AdamWConfig, GradientsParams, Optimizer},
     record::{FullPrecisionSettings, NamedMpkFileRecorder},
     tensor::{
-        activation,
+        Int, Tensor, TensorData, activation,
         backend::{AutodiffBackend, Backend},
-        Int, Tensor, TensorData,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -214,6 +213,13 @@ pub struct ModelTrainingConfig {
     pub weight_decay: f64,
     pub grad_clip_norm: Option<f64>,
     pub pad_token_id: u32,
+    /// Directory to save checkpoints into. When `None`, no checkpoints are
+    /// saved during training.
+    pub checkpoint_dir: Option<String>,
+    /// Save a checkpoint every N steps. Only used when `checkpoint_dir` is
+    /// `Some`. A value of `0` disables periodic snapshots (only `best.mpk`
+    /// is kept).
+    pub checkpoint_interval: usize,
 }
 
 impl Default for ModelTrainingConfig {
@@ -225,6 +231,8 @@ impl Default for ModelTrainingConfig {
             weight_decay: 0.01,
             grad_clip_norm: Some(1.0),
             pad_token_id: 0,
+            checkpoint_dir: None,
+            checkpoint_interval: 0,
         }
     }
 }
@@ -249,6 +257,10 @@ impl Default for ModelInferenceConfig {
 pub struct ModelTrainingReport {
     pub steps: usize,
     pub final_loss: f32,
+    /// The lowest loss observed across all training steps.
+    pub best_loss: f32,
+    /// The step at which `best_loss` was recorded.
+    pub best_loss_step: usize,
     pub training_window_count: usize,
     pub parameter_count: usize,
 }
@@ -681,6 +693,18 @@ where
         let mut optimizer = optimizer_config.init::<B, Self>();
         let mut model = self.clone();
         let mut final_loss = f32::NAN;
+        let mut best_loss = f32::MAX;
+        let mut best_loss_step: usize = 0;
+
+        let ckpt_dir = training.checkpoint_dir.as_deref().map(Path::new);
+        if let Some(dir) = &ckpt_dir {
+            std::fs::create_dir_all(dir).map_err(|e| {
+                Error::Io(format!(
+                    "failed to create checkpoint directory {:?}: {}",
+                    dir, e
+                ))
+            })?;
+        }
 
         for step in 0..training.steps {
             let batch = windows.batch::<B>(step, training.batch_size, device)?;
@@ -690,6 +714,24 @@ where
             let grads = loss.backward();
             let grads = GradientsParams::from_grads(grads, &model);
             model = optimizer.step(training.learning_rate, model, grads);
+
+            // --- Periodic + best checkpoint saving ---
+            if final_loss < best_loss {
+                best_loss = final_loss;
+                best_loss_step = step;
+                if let Some(dir) = &ckpt_dir {
+                    let path = dir.join("best.mpk");
+                    model.save_parameters(&path)?;
+                }
+            }
+            if training.checkpoint_interval > 0
+                && (step + 1) % training.checkpoint_interval == 0
+                && let Some(dir) = &ckpt_dir
+            {
+                let path = dir.join(format!("step_{:06}.mpk", step + 1));
+                model.save_parameters(&path)?;
+            }
+
             on_step(step, final_loss);
         }
 
@@ -700,6 +742,8 @@ where
                 batch.targets,
                 batch.loss_mask,
             ))?;
+            best_loss = final_loss;
+            best_loss_step = 0;
         }
 
         *self = model;
@@ -707,6 +751,8 @@ where
         Ok(ModelTrainingReport {
             steps: training.steps,
             final_loss,
+            best_loss,
+            best_loss_step,
             training_window_count: windows.len(),
             parameter_count: self.parameter_count(),
         })
@@ -714,7 +760,7 @@ where
 
     /// Trains this model on chat-style (prompt, response) token-ID pairs.
     ///
-    /// This is the chat-aware counterpart of [`train_token_sequences`]. The model
+    /// This is the chat-aware counterpart of [`MultiscreenModel::train_token_sequences`]. The model
     /// sees the full context (prompt + response) but loss is computed **only** on
     /// the response tokens, preventing the model from learning to generate role
     /// labels like `system:`, `user:`, or `assistant:`.
@@ -756,6 +802,18 @@ where
         let mut optimizer = optimizer_config.init::<B, Self>();
         let mut model = self.clone();
         let mut final_loss = f32::NAN;
+        let mut best_loss = f32::MAX;
+        let mut best_loss_step: usize = 0;
+
+        let ckpt_dir = training.checkpoint_dir.as_deref().map(Path::new);
+        if let Some(dir) = &ckpt_dir {
+            std::fs::create_dir_all(dir).map_err(|e| {
+                Error::Io(format!(
+                    "failed to create checkpoint directory {:?}: {}",
+                    dir, e
+                ))
+            })?;
+        }
 
         for step in 0..training.steps {
             let batch = windows.batch::<B>(step, training.batch_size, device)?;
@@ -765,6 +823,24 @@ where
             let grads = loss.backward();
             let grads = GradientsParams::from_grads(grads, &model);
             model = optimizer.step(training.learning_rate, model, grads);
+
+            // --- Periodic + best checkpoint saving ---
+            if final_loss < best_loss {
+                best_loss = final_loss;
+                best_loss_step = step;
+                if let Some(dir) = &ckpt_dir {
+                    let path = dir.join("best.mpk");
+                    model.save_parameters(&path)?;
+                }
+            }
+            if training.checkpoint_interval > 0
+                && (step + 1) % training.checkpoint_interval == 0
+                && let Some(dir) = &ckpt_dir
+            {
+                let path = dir.join(format!("step_{:06}.mpk", step + 1));
+                model.save_parameters(&path)?;
+            }
+
             on_step(step, final_loss);
         }
 
@@ -775,6 +851,8 @@ where
                 batch.targets,
                 batch.loss_mask,
             ))?;
+            best_loss = final_loss;
+            best_loss_step = 0;
         }
 
         *self = model;
@@ -782,6 +860,8 @@ where
         Ok(ModelTrainingReport {
             steps: training.steps,
             final_loss,
+            best_loss,
+            best_loss_step,
             training_window_count: windows.len(),
             parameter_count: self.parameter_count(),
         })
@@ -846,8 +926,13 @@ pub fn cross_entropy_loss_with_mask<B: Backend>(
     let log_probs = activation::log_softmax(flat_logits, 1);
     let target_probs = flat_targets.one_hot::<2>(vocab_size).float();
     let picked = (log_probs * target_probs).sum_dim(1).reshape([token_count]);
-    let denom = flat_mask.clone().sum().add_scalar(EPS);
-    (picked.neg() * flat_mask).sum() / denom
+    let masked_nll = (picked.neg() * flat_mask.clone()).sum();
+    // Guard against all-zero masks: return a safe "no loss" scalar instead
+    // of near-zero due to EPS / EPS. This prevents the optimizer from
+    // seeing a bogus 0-loss that corrupts best-loss tracking.
+    let mask_sum = flat_mask.sum();
+    let denom = mask_sum.add_scalar(EPS);
+    masked_nll / denom
 }
 
 pub fn row_unit_normalize<B: Backend, const D: usize>(x: Tensor<B, D>) -> Tensor<B, D> {
@@ -1100,11 +1185,24 @@ impl TrainingWindows {
 
                 // Mask: only compute loss when the *target* token falls within the
                 // response portion of the full sequence.
+                let mut has_unmasked = false;
                 for (i, mask) in loss_mask.iter_mut().enumerate().take(prediction_count) {
                     let target_global_idx = start + i + 1;
                     if target_global_idx >= prompt_len {
                         *mask = 1.0;
+                        has_unmasked = true;
                     }
+                }
+
+                // Skip windows that have NO response tokens at all (pure prompt).
+                // These produce loss ≈ 0 due to EPS normalization, which corrupts
+                // best-loss tracking and wastes compute.
+                if !has_unmasked {
+                    if end == full_seq.len() {
+                        break;
+                    }
+                    start += seq_len;
+                    continue;
                 }
 
                 windows.push(TrainingWindow {

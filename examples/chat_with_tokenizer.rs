@@ -12,7 +12,7 @@
 //!
 //! # One-shot mode:
 //! cargo run --release --example chat_with_tokenizer -- \
-//!     --run-dir runs/my-model --prompt "user: สวัสดี assistant:"
+//!     --run-dir runs/my-model --prompt "สวัสดี"
 //! ```
 
 use anyhow::{Context, Result};
@@ -131,7 +131,13 @@ fn sample_token(
     }
 
     // Temperature scaling
-    let scores: Vec<f32> = scores.iter().map(|s| s / temperature).collect();
+    let mut scores: Vec<f32> = scores.iter().map(|s| s / temperature).collect();
+
+    // Suppress special tokens: <unk>=0, <s>=1
+    scores[0] = f32::NEG_INFINITY;
+    if scores.len() > 1 {
+        scores[1] = f32::NEG_INFINITY;
+    }
 
     // Top-k filtering: keep only the top-k highest scores
     let mut indexed: Vec<(usize, f32)> = scores.iter().copied().enumerate().collect();
@@ -196,10 +202,6 @@ struct Args {
     /// Repetition penalty (>1.0 penalizes repeated tokens).
     #[arg(long, default_value_t = 1.2)]
     repetition_penalty: f32,
-
-    /// System prompt to prepend (sets the character personality).
-    #[arg(long)]
-    system_prompt: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -233,13 +235,6 @@ fn main() -> Result<()> {
     let eos_id = sp.eos_id();
     let pad_token_id: u32 = 0;
 
-    // System prompt — match the training format: "system: ...\n"
-    let system_text = args.system_prompt.as_deref().unwrap_or(
-        "You are หมิว, a shy but sharp ม.6 student who secretly likes ธันวา. \
-         Speak Thai mixed with English naturally. Be caring indirectly, thoughtful, and concise.",
-    );
-    let system_line = format!("system: {system_text}");
-
     eprintln!(
         "sampling: temperature={:.2}, top_k={}, repetition_penalty={:.2}",
         args.temperature, args.top_k, args.repetition_penalty
@@ -262,6 +257,9 @@ fn main() -> Result<()> {
         let mut full_text = String::new();
         let mut recent_tokens: Vec<u32> = Vec::new();
         const RECENT_WINDOW: usize = 16; // track last N tokens for repetition penalty
+
+        let mut consecutive_eos = 0usize;
+        const MAX_CONSECUTIVE_EOS: usize = 3;
 
         for _i in 0..max_new_tokens {
             // Run one forward pass to get logits
@@ -286,8 +284,13 @@ fn main() -> Result<()> {
 
             // Stop at EOS
             if Some(next_token) == eos_id {
+                consecutive_eos += 1;
+                if full_text.is_empty() && consecutive_eos < MAX_CONSECUTIVE_EOS {
+                    continue; // skip EOS at the very start (up to N times)
+                }
                 break;
             }
+            consecutive_eos = 0;
 
             output_ids.push(next_token);
             recent_tokens.push(next_token);
@@ -309,16 +312,9 @@ fn main() -> Result<()> {
 
     // --- One-shot mode ---
     if let Some(prompt) = &args.prompt {
-        // If prompt already starts with "system:" or "user:", use as-is
-        let full_prompt = if prompt.contains(':')
-            && (prompt.starts_with("system:") || prompt.starts_with("user:"))
-        {
-            prompt.clone()
-        } else {
-            format!("{system_line}\nuser: {prompt}\nassistant:")
-        };
+        // Send prompt as-is (no role prefixes)
         let _ = generate(
-            &full_prompt,
+            prompt,
             args.max_new_tokens,
             args.temperature,
             args.top_k,
@@ -328,23 +324,38 @@ fn main() -> Result<()> {
     }
 
     // --- Interactive mode ---
-    eprintln!("interactive mode — type a message, press Enter. Empty line to exit.");
+    eprintln!("interactive mode — type a message, press Enter. Type 'quit' or 'exit' to stop.");
     let stdin = io::stdin();
     loop {
-        print!("you> ");
+        print!("me> ");
         io::stdout().flush()?;
 
         let mut input = String::new();
-        if stdin.read_line(&mut input)? == 0 {
-            break;
+        match stdin.read_line(&mut input) {
+            Ok(0) => {
+                eprintln!("\n[EOF] exiting.");
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("\n[stdin error: {e}] exiting.");
+                break;
+            }
         }
         let input = input.trim();
         if input.is_empty() {
+            continue; // skip blank lines instead of exiting
+        }
+        if input == "quit" || input == "exit" || input == "q" {
+            eprintln!("bye!");
             break;
         }
 
-        // Format: "system: ...\nuser: ...\nassistant:"  — matches training data
-        let prompt = format!("{system_line}\nuser: {input}\nassistant:");
+        // Send prompt directly as raw text, matching the training format:
+        //   training sequence: "คำถาม\nคำตอบ</s>"
+        // The model sees the question + newline as context, then generates the answer.
+        // We append "\n" so the model knows the question is done and should start answering.
+        let prompt = format!("{input}\n");
         print!("ai> ");
         io::stdout().flush()?;
         let _ = generate(

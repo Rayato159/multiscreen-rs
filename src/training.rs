@@ -38,7 +38,7 @@ use crate::error::{Error, Result};
 use crate::model::{
     DefaultMultiscreenModel, ModelTrainingConfig, ModelTrainingReport, MultiscreenModelConfig,
 };
-use crate::runtime::{default_device, Device};
+use crate::runtime::{Device, default_device};
 use std::fs;
 use std::path::Path;
 
@@ -56,6 +56,10 @@ pub struct TrainingReport {
     pub steps: usize,
     /// Final training loss.
     pub final_loss: f32,
+    /// The lowest loss observed across all training steps.
+    pub best_loss: f32,
+    /// The step at which `best_loss` was recorded.
+    pub best_loss_step: usize,
     /// Total number of parameters in the model.
     pub parameter_count: usize,
     /// Path the checkpoint was saved to, if any.
@@ -67,6 +71,8 @@ impl TrainingReport {
         Self {
             steps: report.steps,
             final_loss: report.final_loss,
+            best_loss: report.best_loss,
+            best_loss_step: report.best_loss_step,
             parameter_count: report.parameter_count,
             checkpoint_path,
         }
@@ -85,7 +91,6 @@ pub struct Trainer {
     model: DefaultMultiscreenModel,
     training_config: ModelTrainingConfig,
     checkpoint_dir: Option<String>,
-    #[allow(dead_code)]
     checkpoint_interval: usize,
     #[allow(dead_code)]
     run_dir: Option<String>,
@@ -124,10 +129,14 @@ impl Trainer {
             return Err(Error::Training("no training sequences provided".into()));
         }
 
+        let mut config = self.training_config.clone();
+        config.checkpoint_dir = self.checkpoint_dir.clone();
+        config.checkpoint_interval = self.checkpoint_interval;
+
         let device = self.model_device();
-        let report =
-            self.model
-                .train_token_sequences(sequences, &self.training_config, &device, on_step)?;
+        let report = self
+            .model
+            .train_token_sequences(sequences, &config, &device, on_step)?;
 
         let checkpoint_path = match &self.checkpoint_dir {
             Some(dir) => {
@@ -170,10 +179,14 @@ impl Trainer {
             return Err(Error::Training("no training chat pairs provided".into()));
         }
 
+        let mut config = self.training_config.clone();
+        config.checkpoint_dir = self.checkpoint_dir.clone();
+        config.checkpoint_interval = self.checkpoint_interval;
+
         let device = self.model_device();
-        let report =
-            self.model
-                .train_chat_sequences(chat_pairs, &self.training_config, &device, on_step)?;
+        let report = self
+            .model
+            .train_chat_sequences(chat_pairs, &config, &device, on_step)?;
 
         let checkpoint_path = match &self.checkpoint_dir {
             Some(dir) => {
@@ -374,6 +387,8 @@ impl TrainerBuilder {
             weight_decay: self.weight_decay,
             grad_clip_norm: self.grad_clip_norm,
             pad_token_id: 0,
+            checkpoint_dir: None, // injected by Trainer during training
+            checkpoint_interval: 0,
         };
 
         let run_dir = self.run_dir.or_else(|| Some("runs/latest".to_string()));
@@ -419,6 +434,8 @@ mod tests {
         let model_report = ModelTrainingReport {
             steps: 500,
             final_loss: 0.123,
+            best_loss: 0.100,
+            best_loss_step: 420,
             training_window_count: 100,
             parameter_count: 10_000_000,
         };
@@ -426,6 +443,8 @@ mod tests {
             TrainingReport::from_model_report(&model_report, Some("runs/checkpoint.mpk".into()));
         assert_eq!(report.steps, 500);
         assert!((report.final_loss - 0.123).abs() < f32::EPSILON);
+        assert!((report.best_loss - 0.100).abs() < f32::EPSILON);
+        assert_eq!(report.best_loss_step, 420);
         assert_eq!(report.parameter_count, 10_000_000);
         assert_eq!(
             report.checkpoint_path.as_deref(),

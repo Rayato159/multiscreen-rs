@@ -23,11 +23,15 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use multiscreen_rs::prelude::*;
+use rayon::prelude::*;
 use sentencepiece_rs::SentencePieceProcessor;
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
 use std::fs;
-use std::io::Write;
+use std::hash::{Hash, Hasher};
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 // ---------------------------------------------------------------------------
@@ -119,39 +123,185 @@ struct Args {
     #[arg(long, default_value_t = 100)]
     log_interval: usize,
 
+    /// Save a checkpoint every N steps (0 = only save best).
+    #[arg(long, default_value_t = 0)]
+    checkpoint_interval: usize,
+
+    /// Maximum number of samples to load (0 = all). Useful for huge text files.
+    #[arg(long, default_value_t = 0)]
+    max_samples: usize,
+
     /// Skip training — load existing checkpoint and only run evaluation + report.
     #[arg(long, default_value_t = false)]
     eval_only: bool,
 }
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Split text into sentences, preserving the terminating punctuation.
+/// Handles '.', '!', '?' as sentence boundaries. Also handles '"' after
+/// punctuation (e.g. `said, \"hello.\"`).
+fn split_sentences(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut sentences = Vec::new();
+    let mut start = 0;
+    let n = chars.len();
+    let mut i = 0;
+
+    while i < n {
+        let c = chars[i];
+        if c == '.' || c == '!' || c == '?' {
+            // Include the punctuation
+            let mut end = i + 1;
+            // Also consume a closing quote after punctuation: ." !" ?"
+            if end < n && (chars[end] == '"' || chars[end] == '\'' || chars[end] == '\u{201d}') {
+                end += 1;
+            }
+            let sentence: String = chars[start..end].iter().collect();
+            let trimmed = sentence.trim().to_owned();
+            if !trimmed.is_empty() {
+                sentences.push(trimmed);
+            }
+            start = end;
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+
+    // Handle remaining text (no terminating punctuation)
+    if start < n {
+        let remaining: String = chars[start..].iter().collect();
+        let trimmed = remaining.trim().to_owned();
+        if !trimmed.is_empty() {
+            sentences.push(trimmed);
+        }
+    }
+
+    sentences
+}
+
+// ---------------------------------------------------------------------------
 // Data loading
 // ---------------------------------------------------------------------------
 
-fn load_samples(dir: &Path) -> Result<Vec<(String, String)>> {
+fn load_samples(dir: &Path, max_samples: usize) -> Result<Vec<(String, String)>> {
     let mut samples = Vec::new();
+
+    let is_maxed = |len: usize| max_samples > 0 && len >= max_samples;
+
     for entry in fs::read_dir(dir).with_context(|| format!("cannot read {}", dir.display()))? {
+        if is_maxed(samples.len()) {
+            break;
+        }
         let entry = entry?;
         let path = entry.path();
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         match ext {
-            "txt" => {
-                // Plain text corpus: blank lines separate samples.
-                // Each sample can span multiple lines (joined with space).
-                // Single-line-per-sample also works (no blank line needed).
+            "csv" => {
+                // CSV with `prompt` and `response` columns.
+                // Simple Q&A format: prompt = question, response = answer.
+                // No role prefixes — raw text in, raw text out.
                 let text = fs::read_to_string(&path)
                     .with_context(|| format!("cannot read {}", path.display()))?;
+                let mut reader = csv::ReaderBuilder::new()
+                    .flexible(true)
+                    .from_reader(text.as_bytes());
+
+                // Validate headers
+                let headers = reader.headers()?.clone();
+                let has_prompt = headers.iter().any(|h| h.trim() == "prompt");
+                let has_response = headers.iter().any(|h| h.trim() == "response");
+                if !has_prompt || !has_response {
+                    // Skip CSVs that don't have the expected columns
+                    // (might be some other CSV we don't care about)
+                    continue;
+                }
+
+                let prompt_idx = headers.iter().position(|h| h.trim() == "prompt").unwrap();
+                let response_idx = headers.iter().position(|h| h.trim() == "response").unwrap();
+
+                for result in reader.records() {
+                    if is_maxed(samples.len()) {
+                        break;
+                    }
+                    let record = match result {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    };
+                    let prompt = record.get(prompt_idx).unwrap_or("").trim().to_owned();
+                    let response = record.get(response_idx).unwrap_or("").trim().to_owned();
+                    if prompt.is_empty() || response.is_empty() {
+                        continue;
+                    }
+                    samples.push((prompt, response));
+                }
+            }
+            "txt" => {
+                // Plain text corpus: blank lines separate samples.
+                // Uses streaming BufReader so huge files (e.g. 1.8GB TinyStories)
+                // don't need to fit in memory.
+                //
+                // Each sample spans multiple lines (joined with space).
+                // Stories are split into input (first ~60%) and output (last ~40%)
+                // so the model learns story continuation with loss masking.
+                let file = fs::File::open(&path)
+                    .with_context(|| format!("cannot open {}", path.display()))?;
+                let reader = std::io::BufReader::new(file);
                 let mut current_lines: Vec<String> = Vec::new();
+
                 let flush = |lines: &mut Vec<String>, out: &mut Vec<(String, String)>| {
-                    if !lines.is_empty() {
-                        let joined = lines.join(" ");
-                        if !joined.trim().is_empty() {
-                            out.push((String::new(), joined));
-                        }
-                        lines.clear();
+                    if lines.is_empty() {
+                        return;
+                    }
+                    let story = lines.join(" ");
+                    lines.clear();
+                    let story = story.trim().to_owned();
+                    if story.is_empty() {
+                        return;
+                    }
+
+                    // Split story into sentences preserving punctuation.
+                    // We find sentence boundaries by locating '.', '!', '?' chars.
+                    let sentences = split_sentences(&story);
+
+                    if sentences.len() < 2 {
+                        // Too short to split — use whole thing as response only
+                        out.push((String::new(), story));
+                        return;
+                    }
+
+                    let split_point = (sentences.len() as f64 * 0.6).ceil() as usize;
+                    let split_point = split_point.max(1).min(sentences.len() - 1);
+                    let input = sentences[..split_point].join(" ");
+                    let output = sentences[split_point..].join(" ");
+
+                    if output.is_empty() {
+                        out.push((String::new(), story));
+                    } else {
+                        out.push((input, output));
                     }
                 };
-                for line in text.lines() {
+
+                let mut line_count: u64 = 0;
+                for line_result in reader.lines() {
+                    if is_maxed(samples.len()) {
+                        break;
+                    }
+                    let line = match line_result {
+                        Ok(l) => l,
+                        Err(_) => continue,
+                    };
+                    line_count += 1;
+                    if line_count.is_multiple_of(1_000_000) {
+                        eprintln!(
+                            "  streaming {}: {line_count} lines, {} stories so far",
+                            path.file_name().unwrap_or_default().to_string_lossy(),
+                            samples.len()
+                        );
+                    }
                     if line.trim().is_empty() {
                         flush(&mut current_lines, &mut samples);
                     } else {
@@ -159,6 +309,11 @@ fn load_samples(dir: &Path) -> Result<Vec<(String, String)>> {
                     }
                 }
                 flush(&mut current_lines, &mut samples); // last sample
+                eprintln!(
+                    "  loaded {} stories from {}",
+                    samples.len(),
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                );
             }
             "jsonl" => {
                 let text = fs::read_to_string(&path)
@@ -175,7 +330,7 @@ fn load_samples(dir: &Path) -> Result<Vec<(String, String)>> {
                             samples.push((String::new(), s.to_owned()));
                         }
                         // Format 2: {"messages": [{"role": "...", "content": "..."}, ...]}
-                        // Split into prompt (system + user) and response (assistant).
+                        // Extract raw content without role prefixes.
                         else if let Some(messages) =
                             val.get("messages").and_then(|v| v.as_array())
                         {
@@ -189,10 +344,8 @@ fn load_samples(dir: &Path) -> Result<Vec<(String, String)>> {
                                     continue;
                                 }
                                 match role {
-                                    "assistant" => {
-                                        response_parts.push(format!("{}: {}", role, content))
-                                    }
-                                    _ => prompt_parts.push(format!("{}: {}", role, content)),
+                                    "assistant" => response_parts.push(content.to_owned()),
+                                    _ => prompt_parts.push(content.to_owned()),
                                 }
                             }
                             if !response_parts.is_empty() {
@@ -284,6 +437,70 @@ struct InferenceMetrics {
 }
 
 // ---------------------------------------------------------------------------
+// Tokenization cache
+// ---------------------------------------------------------------------------
+
+/// Cache file format stored as JSON.
+#[derive(Serialize, Deserialize)]
+struct TokenCache {
+    /// Hash of (train_dir file names/sizes + max_samples + tokenizer bytes).
+    cache_key: String,
+    /// Tokenized (prompt, response) pairs.
+    pairs: Vec<(Vec<u32>, Vec<u32>)>,
+}
+
+/// Compute a cache key from the data source configuration.
+fn compute_cache_key(train_dir: &Path, max_samples: usize, tokenizer_path: &Path) -> String {
+    let mut hasher = DefaultHasher::new();
+
+    // Hash file names and sizes from train_dir
+    if let Ok(entries) = fs::read_dir(train_dir) {
+        let mut file_infos: Vec<_> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                let size = e.metadata().ok().map(|m| m.len()).unwrap_or(0);
+                (name, size)
+            })
+            .collect();
+        file_infos.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, size) in &file_infos {
+            name.hash(&mut hasher);
+            size.hash(&mut hasher);
+        }
+    }
+    max_samples.hash(&mut hasher);
+
+    // Hash tokenizer file contents
+    if let Ok(bytes) = fs::read(tokenizer_path) {
+        bytes.hash(&mut hasher);
+    }
+
+    format!("{:016x}", hasher.finish())
+}
+
+/// Try to load tokenized pairs from cache. Returns `None` on any mismatch or error.
+fn try_load_token_cache(path: &Path, expected_key: &str) -> Option<Vec<(Vec<u32>, Vec<u32>)>> {
+    let data = fs::read_to_string(path).ok()?;
+    let cache: TokenCache = serde_json::from_str(&data).ok()?;
+    if cache.cache_key != expected_key {
+        return None;
+    }
+    Some(cache.pairs)
+}
+
+/// Save tokenized pairs to cache.
+fn save_token_cache(path: &Path, cache_key: &str, pairs: &[(Vec<u32>, Vec<u32>)]) -> Result<()> {
+    let cache = TokenCache {
+        cache_key: cache_key.to_owned(),
+        pairs: pairs.to_vec(),
+    };
+    let json = serde_json::to_string(&cache)?;
+    fs::write(path, json)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -307,8 +524,8 @@ fn main() -> Result<()> {
     let eos_id = sp.eos_id();
     println!("tokenizer: vocab_size={vocab_size} eos={eos_id:?}");
 
-    // --- Load & tokenize data ---
-    let samples = load_samples(&args.train_dir)?;
+    // --- Load & tokenize data (with caching) ---
+    let samples = load_samples(&args.train_dir, args.max_samples)?;
     if samples.is_empty() {
         bail!("no training samples found in {}", args.train_dir.display());
     }
@@ -320,31 +537,95 @@ fn main() -> Result<()> {
         println!("detected chat-format data — using loss masking for prompt tokens");
     }
 
-    // Tokenize (prompt, response) pairs separately.
-    let mut chat_pairs: Vec<(Vec<u32>, Vec<u32>)> = samples
-        .iter()
-        .map(|(prompt, response)| {
-            let prompt_ids = if prompt.is_empty() {
-                Vec::new()
+    // Compute a cache key from: train_dir files + max_samples + tokenizer hash.
+    // If the cache file exists and the key matches, skip tokenization.
+    let cache_path = args.run_dir.join("token_cache.json");
+    let cache_key = compute_cache_key(&args.train_dir, args.max_samples, &tokenizer_path);
+
+    let mut chat_pairs: Vec<(Vec<u32>, Vec<u32>)> =
+        if let Some(pairs) = try_load_token_cache(&cache_path, &cache_key) {
+            println!(
+                "loaded {} tokenized pairs from cache ({})",
+                pairs.len(),
+                cache_path.display()
+            );
+            pairs
+        } else {
+            // Tokenize (prompt, response) pairs separately — in parallel with rayon.
+            //
+            // The training sequence will be: prompt_tokens + "\n" + response_tokens + EOS
+            // The \n separator helps the model distinguish where the question ends
+            // and the answer begins. Loss masking ensures only response tokens are learned.
+            eprintln!("tokenizing {} samples (parallel)...", samples.len());
+            let tokenize_start = Instant::now();
+            let newline_ids = sp.encode("\n");
+            let progress = AtomicUsize::new(0);
+            let total = samples.len();
+
+            let pairs: Vec<(Vec<u32>, Vec<u32>)> = samples
+                .par_iter()
+                .enumerate()
+                .filter_map(|(_, (prompt, response))| {
+                    let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done.is_multiple_of(1000) {
+                        eprintln!(
+                            "  tokenized {}/{} ({:.1}s)",
+                            done,
+                            total,
+                            tokenize_start.elapsed().as_secs_f64()
+                        );
+                    }
+                    let prompt_ids = if prompt.is_empty() {
+                        Vec::new()
+                    } else {
+                        let mut ids = sp.encode(prompt);
+                        ids.extend_from_slice(&newline_ids);
+                        ids
+                    };
+                    let mut response_ids = sp.encode(response);
+                    if let Some(eos) = eos_id {
+                        response_ids.push(eos);
+                    }
+                    if prompt_ids.len() + response_ids.len() >= 2 {
+                        Some((prompt_ids, response_ids))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            eprintln!(
+                "tokenized {} pairs in {:.1}s",
+                pairs.len(),
+                tokenize_start.elapsed().as_secs_f64()
+            );
+
+            // Save cache for future runs.
+            eprintln!("saving token cache...");
+            if let Err(e) = save_token_cache(&cache_path, &cache_key, &pairs) {
+                eprintln!("warning: failed to save token cache: {e}");
             } else {
-                sp.encode(prompt)
-            };
-            let mut response_ids = sp.encode(response);
-            if let Some(eos) = eos_id {
-                response_ids.push(eos);
+                println!("token cache saved: {}", cache_path.display());
             }
-            (prompt_ids, response_ids)
-        })
-        .filter(|(p, r)| p.len() + r.len() >= 2)
-        .collect();
+            eprintln!("cache save done.");
+
+            pairs
+        };
 
     if chat_pairs.is_empty() {
         bail!("all samples tokenized to <2 tokens — cannot train");
     }
 
     // Deduplicate
+    eprintln!("deduplicating {} pairs...", chat_pairs.len());
+    let dedup_start = Instant::now();
     chat_pairs.sort();
     chat_pairs.dedup();
+    eprintln!(
+        "dedup done: {} pairs in {:.1}s",
+        chat_pairs.len(),
+        dedup_start.elapsed().as_secs_f64()
+    );
 
     // Build flat sequences for evaluation (prompt + response concatenated).
     let sequences: Vec<Vec<u32>> = chat_pairs
@@ -400,6 +681,7 @@ fn main() -> Result<()> {
     );
 
     // --- Build model config ---
+    eprintln!("building model config...");
     let budget = parse_budget(&args.budget)?;
     let config = MultiscreenModelConfig::for_parameter_budget(budget, vocab_size, args.seq_len);
     let param_count = config.estimated_parameter_count();
@@ -414,9 +696,14 @@ fn main() -> Result<()> {
         .with_context(|| "failed to copy tokenizer to run dir")?;
 
     // --- Device ---
+    eprintln!("initializing device...");
+    let device_start = Instant::now();
     let device = auto_device()?;
     let device_name = device_label(&device);
-    println!("device: {device_name}");
+    println!(
+        "device: {device_name} (took {:.1}s)",
+        device_start.elapsed().as_secs_f64()
+    );
 
     let final_ckpt = ckpt_dir.join("latest.mpk");
 
@@ -465,6 +752,8 @@ fn main() -> Result<()> {
             .with_context(|| format!("cannot create loss CSV at {}", loss_csv_path.display()))?;
         writeln!(loss_csv, "step,loss")?;
 
+        eprintln!("building trainer (model init on GPU)...");
+        let trainer_start = Instant::now();
         let mut trainer = Trainer::builder()
             .vocab_size(vocab_size)
             .budget(budget)
@@ -483,7 +772,12 @@ fn main() -> Result<()> {
             .steps(args.steps)
             .learning_rate(args.lr)
             .checkpoint_dir(ckpt_dir.to_string_lossy().into_owned())
+            .checkpoint_interval(args.checkpoint_interval)
             .build()?;
+        eprintln!(
+            "trainer built in {:.1}s",
+            trainer_start.elapsed().as_secs_f64()
+        );
 
         let log_interval = args.log_interval;
         let mut bl = f64::MAX;
@@ -499,8 +793,9 @@ fn main() -> Result<()> {
                     bl = loss_f64;
                 }
 
-                // Write to CSV
+                // Write to CSV and flush immediately so data survives a crash.
                 let _ = writeln!(&mut loss_csv, "{step},{loss_f64}");
+                let _ = loss_csv.flush();
 
                 // Log progress
                 if step == 0 || (step + 1) % log_interval == 0 {
@@ -536,8 +831,9 @@ fn main() -> Result<()> {
                     bl = loss_f64;
                 }
 
-                // Write to CSV
+                // Write to CSV and flush immediately so data survives a crash.
                 let _ = writeln!(&mut loss_csv, "{step},{loss_f64}");
+                let _ = loss_csv.flush();
 
                 // Log progress
                 if step == 0 || (step + 1) % log_interval == 0 {
@@ -568,17 +864,39 @@ fn main() -> Result<()> {
 
         println!("\ntraining complete in {:.1}s ({:.1} steps/s)", ts, sps);
         println!(
-            "  final loss: {:.6}  best loss: {:.6}  params: {}",
-            rpt.final_loss, bl, rpt.parameter_count
+            "  final loss: {:.6}  best loss: {:.6} (step {})  params: {}",
+            rpt.final_loss,
+            rpt.best_loss,
+            rpt.best_loss_step + 1,
+            rpt.parameter_count
         );
 
-        // Save final checkpoint + metadata
-        trainer.save_checkpoint(final_ckpt.to_str().unwrap())?;
-        println!("checkpoint: {}", final_ckpt.display());
+        // The model already saved `best.mpk` during training.
+        // Also save the final weights as `final.mpk`.
+        let final_path = ckpt_dir.join("final.mpk");
+        trainer.save_checkpoint(final_path.to_str().unwrap())?;
+        println!("final checkpoint: {}", final_path.display());
+
+        // Copy best.mpk → latest.mpk so chat/eval always uses the best weights.
+        let best_path = ckpt_dir.join("best.mpk");
+        if best_path.exists() {
+            fs::copy(&best_path, &final_ckpt)
+                .with_context(|| format!("failed to copy {:?} → {:?}", best_path, final_ckpt))?;
+            println!(
+                "best checkpoint (loss {:.6} @ step {}): {}",
+                rpt.best_loss,
+                rpt.best_loss_step + 1,
+                final_ckpt.display()
+            );
+        } else {
+            // Fallback: no best checkpoint was saved (shouldn't happen with checkpoint_dir set)
+            trainer.save_checkpoint(final_ckpt.to_str().unwrap())?;
+            println!("checkpoint: {}", final_ckpt.display());
+        }
 
         let meta = RunMeta {
             step: rpt.steps,
-            loss: rpt.final_loss as f64,
+            loss: rpt.best_loss as f64,
             params: rpt.parameter_count,
             model_config: config.clone(),
         };
@@ -590,7 +908,14 @@ fn main() -> Result<()> {
         // Free trainer + model from GPU before evaluation.
         drop(trainer);
 
-        (rpt.steps, rpt.final_loss, rpt.parameter_count, ts, sps, bl)
+        (
+            rpt.steps,
+            rpt.final_loss,
+            rpt.parameter_count,
+            ts,
+            sps,
+            rpt.best_loss as f64,
+        )
     };
 
     // --- Evaluate on val and test sets ---
@@ -606,7 +931,7 @@ fn main() -> Result<()> {
         m.load_parameters(&final_ckpt)?;
         m.valid() // MultiscreenModel<Autodiff<Cuda>> → MultiscreenModel<Cuda>
     };
-    let inner_device = device.clone();
+    let inner_device = device;
 
     let val_metrics = if !val_seqs.is_empty() {
         println!("  validation set ({} sequences)...", val_seqs.len());
@@ -655,8 +980,23 @@ fn main() -> Result<()> {
 
     // --- Measure inference latency ---
     println!("\nmeasuring inference latency...");
-    let prompt = "User: hello how are you today Assistant:";
-    let prompt_ids = sp.encode(prompt);
+    // Use a prompt that matches the training data format.
+    // For TinyStories (story continuation): start of a story.
+    // For chat data (Q&A): a question followed by newline.
+    let prompt = if has_chat_data {
+        // Use the first training sample's prompt if available
+        match train_pairs.first() {
+            Some((p, _)) if !p.is_empty() => {
+                // Decode prompt tokens back to text for display
+                sp.decode(p)
+            }
+            _ => "Once upon a time, there was a little".to_owned(),
+        }
+    } else {
+        "Once upon a time, there was a little".to_owned()
+    };
+    println!("  sample prompt: {prompt}");
+    let prompt_ids = sp.encode(&prompt);
     let chat_model = ChatModel::load(&final_ckpt)?;
 
     let latency_start = Instant::now();
@@ -687,10 +1027,18 @@ fn main() -> Result<()> {
     );
 
     // --- Generate sample output ---
-    let output_text = sp.decode(&output);
+    // Decode only the NEW tokens (skip the prompt part)
+    let new_token_ids: Vec<u32> = if output.len() > prompt_ids.len() {
+        output[prompt_ids.len()..].to_vec()
+    } else {
+        output.clone()
+    };
+    let generated_text = sp.decode(&new_token_ids);
+    let full_text = sp.decode(&output);
     println!("\nsample output:");
-    println!("  prompt: {prompt}");
-    println!("  output: {output_text}");
+    println!("  prompt:    {prompt}");
+    println!("  generated: {generated_text}");
+    println!("  full:      {full_text}");
 
     // --- Write report ---
     let full_report = TrainReport {

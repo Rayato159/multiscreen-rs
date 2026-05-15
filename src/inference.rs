@@ -38,7 +38,7 @@
 
 use crate::error::{Error, Result};
 use crate::model::{ModelInferenceConfig, MultiscreenModel, MultiscreenModelConfig};
-use crate::runtime::{default_device, DefaultAutodiffBackend, DefaultBackend, InferenceDevice};
+use crate::runtime::{DefaultAutodiffBackend, DefaultBackend, InferenceDevice, default_device};
 use burn::module::AutodiffModule;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -135,7 +135,7 @@ impl ChatModel {
         let device = default_device()?;
         let mut model = MultiscreenModel::<DefaultAutodiffBackend>::new(config.clone(), &device)?;
         model.load_parameters(checkpoint_path)?;
-        let inner_device = device.clone();
+        let inner_device = device;
         let model = model.valid(); // Strip Autodiff wrapper → MultiscreenModel<DefaultBackend>
 
         Ok(Self {

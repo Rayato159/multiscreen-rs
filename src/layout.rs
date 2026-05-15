@@ -53,10 +53,10 @@ impl ScreenLayout {
         let mut screen_start = 0usize;
 
         loop {
-            if let Some(max_screen_count) = config.screens.max_screen_count {
-                if screens.len() >= max_screen_count {
-                    break;
-                }
+            if let Some(max_screen_count) = config.screens.max_screen_count
+                && screens.len() >= max_screen_count
+            {
+                break;
             }
 
             let screen_end = screen_start
