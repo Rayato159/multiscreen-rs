@@ -55,6 +55,13 @@ cargo run --release --features cuda --example chat_with_tokenizer -- \
 
 > Run with `--help` to see all options (training & chat).
 
+### Loss Plot
+
+```bash
+python examples/plot_loss.py runs/my-model/loss.csv
+# Creates runs/my-model/loss.png
+```
+
 ---
 
 ## Data Formats
