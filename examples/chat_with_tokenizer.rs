@@ -59,10 +59,28 @@ impl SpTokenizer {
     }
 }
 
-/// Decode a token piece from SentencePiece: replace `▁` with space.
-fn piece_to_text(piece: &str) -> &str {
+/// Decode a token piece from SentencePiece.
+///
+/// Handles three cases:
+/// - `<0xNN>` → byte fallback token → convert to actual char
+/// - `▁` prefix → SentencePiece space marker → replace with space
+/// - anything else → return as-is
+fn piece_to_text(piece: &str) -> String {
+    // SentencePiece byte fallback: <0xNN> → raw byte
+    if piece.starts_with("<0x")
+        && piece.ends_with('>')
+        && piece.len() == 6
+        && let Ok(byte_val) = u8::from_str_radix(&piece[3..5], 16)
+    {
+        return (byte_val as char).to_string();
+    }
+
     // SentencePiece uses U+2581 (▁) as space marker
-    piece.strip_prefix('\u{2581}').unwrap_or(piece)
+    if let Some(rest) = piece.strip_prefix('\u{2581}') {
+        return format!(" {rest}");
+    }
+
+    piece.to_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -133,10 +151,21 @@ fn sample_token(
     // Temperature scaling
     let mut scores: Vec<f32> = scores.iter().map(|s| s / temperature).collect();
 
-    // Suppress special tokens: <unk>=0, <s>=1
+    // Suppress special tokens: <unk>=0, <0x00>=1, </s>=2
     scores[0] = f32::NEG_INFINITY;
     if scores.len() > 1 {
         scores[1] = f32::NEG_INFINITY;
+    }
+    if scores.len() > 2 {
+        scores[2] = f32::NEG_INFINITY; // </s> — don't generate unless forced
+    }
+
+    // Suppress byte fallback tokens (<0xNN>) — they produce garbage output.
+    // SentencePiece with byte_fallback places them at IDs 3..258 (after <unk>, <0x00>, </s>).
+    // These tokens represent raw bytes, not meaningful text — the model should use
+    // proper subword tokens instead. Suppressing forces the model to pick real tokens.
+    for i in 3..scores.len().min(259) {
+        scores[i] = f32::NEG_INFINITY;
     }
 
     // Top-k filtering: keep only the top-k highest scores
@@ -301,7 +330,7 @@ fn main() -> Result<()> {
             // Decode and print
             let piece = sp.id_to_piece(next_token);
             let text = piece_to_text(&piece);
-            full_text.push_str(text);
+            full_text.push_str(&text);
             print!("{text}");
             io::stdout().flush().ok();
         }
