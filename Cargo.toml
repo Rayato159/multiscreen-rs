@@ -1,7 +1,7 @@
 [package]
 name = "multiscreen-rs"
 authors = ["Ruangyot Nanchiang <rayato159@gmail.com>"]
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 license = "MIT"
 description = "A Rust implementation of the Multiscreen neural language model — training and inference powered by Burn."
