@@ -1,6 +1,6 @@
 use crate::config::MultiscreenConfig;
 use crate::error::{Error, Result};
-use crate::layout::{causal_trim_relevance, ScreenLayout};
+use crate::layout::{ScreenLayout, causal_trim_relevance};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;

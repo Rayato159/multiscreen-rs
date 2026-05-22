@@ -1,6 +1,6 @@
 use burn::{
     module::Module,
-    tensor::{backend::Backend, Int, Tensor},
+    tensor::{Int, Tensor, backend::Backend},
 };
 
 /// Minimal language-model trait used by the Burn-backed Multiscreen model.
